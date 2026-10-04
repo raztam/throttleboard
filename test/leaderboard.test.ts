@@ -35,6 +35,8 @@ let baseUrl = "";
 let rangeResult: Array<{ value: string; score: number }> = [];
 let rangeCalls: RangeCall[] = [];
 let redisFails = false;
+const cache = new Map<string, string>();
+let setCalls: Array<{ key: string; ex: number }> = [];
 
 const redis: LeaderboardRedis = {
   async zRangeWithScores(key, min, max, options) {
@@ -43,6 +45,18 @@ const redis: LeaderboardRedis = {
     }
     rangeCalls.push({ key, min, max, REV: options.REV });
     return rangeResult;
+  },
+  async mGet(keys) {
+    return keys.map((key) => cache.get(key) ?? null);
+  },
+  async set(key, value, options) {
+    cache.set(key, value);
+    setCalls.push({ key, ex: options.EX });
+    return "OK";
+  },
+  async del(key) {
+    cache.delete(key);
+    return 1;
   },
 };
 
@@ -81,6 +95,8 @@ beforeEach(async () => {
   rangeResult = [];
   rangeCalls = [];
   redisFails = false;
+  cache.clear();
+  setCalls = [];
   await Player.deleteMany({});
 });
 
@@ -142,6 +158,23 @@ describe("leaderboard routes", { concurrency: 1 }, () => {
     assert.deepEqual(rangeCalls, [
       { key: "leaderboard:global", min: 0, max: 2, REV: true },
     ]);
+  });
+
+  it("serves a cached username after the player is removed from Mongo", async () => {
+    const ada = await createPlayer("ada");
+    rangeResult = [{ value: ada._id.toString(), score: 40 }];
+
+    const first = await request("?limit=1");
+    assert.equal(asLeaderboard(first.json)[0]?.username, "ada");
+    assert.deepEqual(setCalls, [
+      { key: `player:profile:${ada._id.toString()}`, ex: 3600 },
+    ]);
+
+    await Player.deleteOne({ _id: ada._id });
+    const second = await request("?limit=1");
+
+    assert.equal(asLeaderboard(second.json)[0]?.username, "ada");
+    assert.equal(setCalls.length, 1);
   });
 
   it("defaults to the top 10", async () => {

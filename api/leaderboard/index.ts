@@ -1,12 +1,12 @@
 import { Router, type ErrorRequestHandler } from "express";
 import mongoose from "mongoose";
-import { Player } from "../../models/Player.js";
+import { getPlayerProfiles, type ProfileCacheRedis } from "../player/cache.js";
 
 const LEADERBOARD_KEY = "leaderboard:global";
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
 
-export interface LeaderboardRedis {
+export interface LeaderboardRedis extends ProfileCacheRedis {
   zRangeWithScores(
     key: string,
     min: number,
@@ -58,13 +58,7 @@ export function createLeaderboardRouter(redis: LeaderboardRedis): Router {
     const playerIds = ranked
       .map((entry) => entry.value)
       .filter((id) => mongoose.isValidObjectId(id));
-    const players =
-      playerIds.length === 0
-        ? []
-        : await Player.find({ _id: { $in: playerIds } });
-    const playersById = new Map(
-      players.map((player) => [player._id.toString(), player]),
-    );
+    const playersById = await getPlayerProfiles(redis, playerIds);
 
     const leaderboard = ranked.flatMap((entry, index) => {
       const player = playersById.get(entry.value);
