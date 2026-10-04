@@ -4,7 +4,7 @@ import express from "express";
 import mongoose from "mongoose";
 import { createClient } from "redis";
 import { createLeaderboardRouter } from "./api/leaderboard/index.js";
-import { playerRouter } from "./api/player/index.js";
+import { createPlayerRouter } from "./api/player/index.js";
 import { createPlayerRankRouter } from "./api/players/index.js";
 import { createScoresRouter } from "./api/scores/index.js";
 import { createRateLimiter } from "./middleware/rateLimiter.js";
@@ -43,7 +43,7 @@ app.post("/api/scores", scoreLimiter);
 app.get("/api/players/:id/rank", readLimiter);
 app.get("/api/leaderboard", readLimiter);
 
-app.use("/api/player", playerRouter);
+app.use("/api/player", createPlayerRouter(redis));
 app.use("/api/players", createPlayerRankRouter(redis));
 app.use("/api/scores", createScoresRouter(redis));
 app.use("/api/leaderboard", createLeaderboardRouter(redis));

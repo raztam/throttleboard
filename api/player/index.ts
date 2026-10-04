@@ -1,8 +1,22 @@
 import { Router, type ErrorRequestHandler } from "express";
 import mongoose from "mongoose";
 import { Player } from "../../models/Player.js";
+import {
+  getPlayerProfiles,
+  invalidatePlayerProfile,
+  type ProfileCacheRedis,
+} from "./cache.js";
 
-export const playerRouter = Router();
+const LEADERBOARD_KEY = "leaderboard:global";
+
+export interface PlayerRedis extends ProfileCacheRedis {
+  zScore(key: string, member: string): Promise<number | null>;
+  zRevRank(key: string, member: string): Promise<number | null>;
+  zRem(key: string, member: string): Promise<number>;
+}
+
+export function createPlayerRouter(redis: PlayerRedis): Router {
+  const playerRouter = Router();
 
 interface PlayerCreate {
   username: string;
@@ -136,13 +150,23 @@ playerRouter.get("/:id", async (req, res) => {
     return;
   }
 
-  const player = await Player.findById(id);
+  const profiles = await getPlayerProfiles(redis, [id]);
+  const player = profiles.get(id);
   if (!player) {
     res.status(404).json({ error: "Player not found" });
     return;
   }
 
-  res.json(player);
+  const [rank, score] = await Promise.all([
+    redis.zRevRank(LEADERBOARD_KEY, id),
+    redis.zScore(LEADERBOARD_KEY, id),
+  ]);
+
+  res.json({
+    ...player,
+    score,
+    rank: rank === null ? null : rank + 1,
+  });
 });
 
 playerRouter.patch("/:id", async (req, res) => {
@@ -167,6 +191,7 @@ playerRouter.patch("/:id", async (req, res) => {
       res.status(404).json({ error: "Player not found" });
       return;
     }
+    await invalidatePlayerProfile(redis, id);
     res.json(player);
   } catch (err) {
     if (isDuplicateKey(err)) {
@@ -190,6 +215,13 @@ playerRouter.delete("/:id", async (req, res) => {
     return;
   }
 
+  await invalidatePlayerProfile(redis, id);
+  try {
+    await redis.zRem(LEADERBOARD_KEY, id);
+  } catch (err) {
+    console.error("Leaderboard removal failed:", err);
+  }
+
   res.status(204).end();
 });
 
@@ -201,3 +233,5 @@ const handleError: ErrorRequestHandler = (err, _req, res, _next) => {
 };
 
 playerRouter.use(handleError);
+return playerRouter;
+}

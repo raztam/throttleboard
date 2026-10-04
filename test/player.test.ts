@@ -5,7 +5,7 @@ import { after, before, beforeEach, describe, it } from "node:test";
 import express from "express";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import mongoose from "mongoose";
-import { playerRouter } from "../api/player/index.js";
+import { createPlayerRouter, type PlayerRedis } from "../api/player/index.js";
 import { Player } from "../models/Player.js";
 
 interface PlayerJson {
@@ -16,6 +16,25 @@ interface PlayerJson {
   createdAt: string;
 }
 
+interface ProfileJson {
+  _id: string;
+  username: string;
+  email: string;
+  createdAt: string;
+  score: number | null;
+  rank: number | null;
+}
+
+interface SetCall {
+  key: string;
+  ex: number;
+}
+
+interface ZRemCall {
+  key: string;
+  member: string;
+}
+
 interface ErrorJson {
   error: string;
 }
@@ -23,6 +42,43 @@ interface ErrorJson {
 let mongo: MongoMemoryServer | undefined;
 let server: Server | undefined;
 let baseUrl = "";
+const cache = new Map<string, string>();
+const scores = new Map<string, number>();
+let setCalls: SetCall[] = [];
+let deletedKeys: string[] = [];
+let zRemCalls: ZRemCall[] = [];
+
+const redis: PlayerRedis = {
+  async mGet(keys) {
+    return keys.map((key) => cache.get(key) ?? null);
+  },
+  async set(key, value, options) {
+    cache.set(key, value);
+    setCalls.push({ key, ex: options.EX });
+    return "OK";
+  },
+  async del(key) {
+    cache.delete(key);
+    deletedKeys.push(key);
+    return 1;
+  },
+  async zScore(_key, member) {
+    return scores.get(member) ?? null;
+  },
+  async zRevRank(_key, member) {
+    if (!scores.has(member)) {
+      return null;
+    }
+    const ordered = [...scores.entries()].sort(
+      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+    );
+    return ordered.findIndex(([id]) => id === member);
+  },
+  async zRem(key, member) {
+    zRemCalls.push({ key, member });
+    return scores.delete(member) ? 1 : 0;
+  },
+};
 
 before(async () => {
   mongo = await MongoMemoryServer.create();
@@ -31,7 +87,7 @@ before(async () => {
 
   const app = express();
   app.use(express.json());
-  app.use("/api/player", playerRouter);
+  app.use("/api/player", createPlayerRouter(redis));
   const listening = app.listen(0, "127.0.0.1");
   server = listening;
   await new Promise<void>((resolve, reject) => {
@@ -57,6 +113,11 @@ after(async () => {
 });
 
 beforeEach(async () => {
+  cache.clear();
+  scores.clear();
+  setCalls = [];
+  deletedKeys = [];
+  zRemCalls = [];
   await Player.deleteMany({});
 });
 
@@ -82,6 +143,18 @@ function asPlayer(json: unknown): PlayerJson {
   assert.equal(typeof player.email, "string");
   assert.equal(typeof player.highScore, "number");
   return player;
+}
+
+function asProfile(json: unknown): ProfileJson {
+  assert.ok(json && typeof json === "object");
+  const profile = json as ProfileJson;
+  assert.equal(typeof profile._id, "string");
+  assert.equal(typeof profile.username, "string");
+  assert.equal(typeof profile.email, "string");
+  assert.equal(typeof profile.createdAt, "string");
+  assert.ok(profile.score === null || typeof profile.score === "number");
+  assert.ok(profile.rank === null || typeof profile.rank === "number");
+  return profile;
 }
 
 function asError(json: unknown): string {
@@ -186,17 +259,46 @@ describe("player routes", { concurrency: 1 }, () => {
     );
   });
 
-  it("returns one player by id", async () => {
+  it("returns a cached profile with the live sorted-set score and rank", async () => {
     const created = await createPlayer({
       username: "ada",
       email: "ada@example.com",
       highScore: 12,
     });
+    scores.set(created._id, 12);
 
     const response = await request("GET", `/${created._id}`);
 
     assert.equal(response.status, 200);
-    assert.equal(asPlayer(response.json).highScore, 12);
+    const profile = asProfile(response.json);
+    assert.equal(profile.username, "ada");
+    assert.equal(profile.email, "ada@example.com");
+    assert.equal(profile.score, 12);
+    assert.equal(profile.rank, 1);
+    assert.deepEqual(setCalls, [
+      { key: `player:profile:${created._id}`, ex: 3600 },
+    ]);
+
+    await Player.deleteOne({ _id: created._id });
+    const cached = await request("GET", `/${created._id}`);
+
+    assert.equal(cached.status, 200);
+    assert.equal(asProfile(cached.json).username, "ada");
+    assert.equal(setCalls.length, 1);
+  });
+
+  it("returns null score and rank when the player is unranked", async () => {
+    const created = await createPlayer({
+      username: "ada",
+      email: "ada@example.com",
+    });
+
+    const response = await request("GET", `/${created._id}`);
+
+    assert.equal(response.status, 200);
+    const profile = asProfile(response.json);
+    assert.equal(profile.score, null);
+    assert.equal(profile.rank, null);
   });
 
   it("returns 404 for an unknown player and 400 for a bad id", async () => {
@@ -225,6 +327,26 @@ describe("player routes", { concurrency: 1 }, () => {
     assert.equal(player.highScore, 40);
     assert.equal(player.username, "ada");
     assert.equal(player.email, "ada@example.com");
+    assert.deepEqual(deletedKeys, [`player:profile:${created._id}`]);
+  });
+
+  it("reloads the profile after a username change", async () => {
+    const created = await createPlayer({
+      username: "ada",
+      email: "ada@example.com",
+    });
+    await request("GET", `/${created._id}`);
+
+    const updated = await request("PATCH", `/${created._id}`, {
+      username: "grace",
+    });
+    const again = await request("GET", `/${created._id}`);
+
+    assert.equal(updated.status, 200);
+    assert.equal(asPlayer(updated.json).username, "grace");
+    assert.deepEqual(deletedKeys, [`player:profile:${created._id}`]);
+    assert.equal(asProfile(again.json).username, "grace");
+    assert.equal(setCalls.length, 2);
   });
 
   it("rejects an empty update and a duplicate email", async () => {
@@ -254,13 +376,22 @@ describe("player routes", { concurrency: 1 }, () => {
       email: "ada@example.com",
     });
 
+    scores.set(created._id, 9);
+    await request("GET", `/${created._id}`);
+
     const removed = await request("DELETE", `/${created._id}`);
     const missing = await request("GET", `/${created._id}`);
     const missingDelete = await request("DELETE", `/${created._id}`);
 
     assert.equal(removed.status, 204);
     assert.equal(removed.json, null);
+    assert.deepEqual(deletedKeys, [`player:profile:${created._id}`]);
+    assert.deepEqual(zRemCalls, [
+      { key: "leaderboard:global", member: created._id },
+    ]);
+    assert.equal(scores.has(created._id), false);
     assert.equal(missing.status, 404);
     assert.equal(missingDelete.status, 404);
+    assert.equal(zRemCalls.length, 1);
   });
 });
