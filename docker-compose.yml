@@ -34,6 +34,7 @@ services:
       REDIS_URL: redis://redis:6379
     volumes:
       - ./server.ts:/app/server.ts
+      - ./app.ts:/app/app.ts
       - ./api:/app/api
       - ./models:/app/models
       - ./middleware:/app/middleware
