@@ -6,13 +6,16 @@ import {
   invalidatePlayerProfile,
   type ProfileCacheRedis,
 } from "./cache.js";
+import {
+  recordProfileView,
+  removeProfileViews,
+  type ViewCommandRedis,
+} from "./views.js";
 
 const LEADERBOARD_KEY = "leaderboard:global";
 
-export interface PlayerRedis extends ProfileCacheRedis {
-  zScore(key: string, member: string): Promise<number | null>;
+export interface PlayerRedis extends ProfileCacheRedis, ViewCommandRedis {
   zRevRank(key: string, member: string): Promise<number | null>;
-  zRem(key: string, member: string): Promise<number>;
 }
 
 export function createPlayerRouter(redis: PlayerRedis): Router {
@@ -157,13 +160,19 @@ playerRouter.get("/:id", async (req, res) => {
     return;
   }
 
-  const [rank, score] = await Promise.all([
+  const [views, rank, score] = await Promise.all([
+    recordProfileView(redis, id),
     redis.zRevRank(LEADERBOARD_KEY, id),
     redis.zScore(LEADERBOARD_KEY, id),
   ]);
+  if (views === null) {
+    res.status(500).json({ error: "Internal server error" });
+    return;
+  }
 
   res.json({
     ...player,
+    views,
     score,
     rank: rank === null ? null : rank + 1,
   });
@@ -218,6 +227,7 @@ playerRouter.delete("/:id", async (req, res) => {
   await invalidatePlayerProfile(redis, id);
   try {
     await redis.zRem(LEADERBOARD_KEY, id);
+    await removeProfileViews(redis, id);
   } catch (err) {
     console.error("Leaderboard removal failed:", err);
   }

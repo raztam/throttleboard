@@ -5,6 +5,8 @@ import mongoose from "mongoose";
 import { createClient } from "redis";
 import { createLeaderboardRouter } from "./api/leaderboard/index.js";
 import { createPlayerRouter } from "./api/player/index.js";
+import { startViewCountFlush } from "./api/player/views.js";
+import { createMostViewedRouter } from "./api/players/mostViewed.js";
 import { createPlayerRankRouter } from "./api/players/index.js";
 import { createScoresRouter } from "./api/scores/index.js";
 import { createRateLimiter } from "./middleware/rateLimiter.js";
@@ -41,9 +43,11 @@ const createAccountLimiter = createRateLimiter(redis, {
 app.post("/api/player", createAccountLimiter);
 app.post("/api/scores", scoreLimiter);
 app.get("/api/players/:id/rank", readLimiter);
+app.get("/api/players/most-viewed", readLimiter);
 app.get("/api/leaderboard", readLimiter);
 
 app.use("/api/player", createPlayerRouter(redis));
+app.use("/api/players", createMostViewedRouter(redis));
 app.use("/api/players", createPlayerRankRouter(redis));
 app.use("/api/scores", createScoresRouter(redis));
 app.use("/api/leaderboard", createLeaderboardRouter(redis));
@@ -94,10 +98,19 @@ async function connectWithRetry(
   throw lastError;
 }
 
+let stopViewFlush: (() => Promise<void>) | undefined;
+
 async function shutdown(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.close((err) => (err ? reject(err) : resolve()));
   });
+  if (stopViewFlush) {
+    try {
+      await stopViewFlush();
+    } catch (err) {
+      console.error("View count flush failed:", err);
+    }
+  }
   if (redis.isOpen) {
     await redis.quit();
   }
@@ -107,6 +120,7 @@ async function shutdown(server: Server): Promise<void> {
 async function start(): Promise<void> {
   await connectWithRetry("MongoDB", () => mongoose.connect(MONGODB_URI));
   await connectWithRetry("Redis", () => redis.connect());
+  stopViewFlush = startViewCountFlush(redis);
 
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`ThrottleBoard listening on port ${PORT}`);

@@ -4,6 +4,7 @@ const playerSchema = new Schema({
   username: { type: String, required: true, unique: true },
   email: { type: String, required: true, unique: true },
   highScore: { type: Number, default: 0 },
+  views: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now },
 });
 

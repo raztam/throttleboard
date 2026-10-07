@@ -6,6 +6,12 @@ import express from "express";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import mongoose from "mongoose";
 import { createPlayerRouter, type PlayerRedis } from "../api/player/index.js";
+import {
+  VIEWS_ALL_KEY,
+  VIEWS_DIRTY_KEY,
+  dailyViewsKey,
+  weeklyViewsKey,
+} from "../api/player/viewKeys.js";
 import { Player } from "../models/Player.js";
 
 interface PlayerJson {
@@ -21,6 +27,7 @@ interface ProfileJson {
   username: string;
   email: string;
   createdAt: string;
+  views: number;
   score: number | null;
   rank: number | null;
 }
@@ -28,6 +35,7 @@ interface ProfileJson {
 interface SetCall {
   key: string;
   ex: number;
+  nx: boolean;
 }
 
 interface ZRemCall {
@@ -44,17 +52,34 @@ let server: Server | undefined;
 let baseUrl = "";
 const cache = new Map<string, string>();
 const scores = new Map<string, number>();
+const boards = new Map<string, Map<string, number>>();
+const dirty = new Set<string>();
 let setCalls: SetCall[] = [];
 let deletedKeys: string[] = [];
 let zRemCalls: ZRemCall[] = [];
+let sRemCalls: ZRemCall[] = [];
+let evalCalls = 0;
+
+function board(key: string): Map<string, number> {
+  const found = boards.get(key);
+  if (found) {
+    return found;
+  }
+  const created = new Map<string, number>();
+  boards.set(key, created);
+  return created;
+}
 
 const redis: PlayerRedis = {
   async mGet(keys) {
     return keys.map((key) => cache.get(key) ?? null);
   },
   async set(key, value, options) {
+    if (options.NX && cache.has(key)) {
+      return null;
+    }
     cache.set(key, value);
-    setCalls.push({ key, ex: options.EX });
+    setCalls.push({ key, ex: options.EX, nx: options.NX === true });
     return "OK";
   },
   async del(key) {
@@ -62,8 +87,11 @@ const redis: PlayerRedis = {
     deletedKeys.push(key);
     return 1;
   },
-  async zScore(_key, member) {
-    return scores.get(member) ?? null;
+  async zScore(key, member) {
+    if (key === "leaderboard:global") {
+      return scores.get(member) ?? null;
+    }
+    return board(key).get(member) ?? null;
   },
   async zRevRank(_key, member) {
     if (!scores.has(member)) {
@@ -76,7 +104,39 @@ const redis: PlayerRedis = {
   },
   async zRem(key, member) {
     zRemCalls.push({ key, member });
-    return scores.delete(member) ? 1 : 0;
+    if (key === "leaderboard:global") {
+      return scores.delete(member) ? 1 : 0;
+    }
+    return board(key).delete(member) ? 1 : 0;
+  },
+  async eval(_script, options) {
+    evalCalls += 1;
+    const profileKey = options.keys[0];
+    const id = options.arguments[1];
+    if (!profileKey || !id) {
+      return -1;
+    }
+    const raw = cache.get(profileKey);
+    if (!raw) {
+      return -1;
+    }
+    const profile = JSON.parse(raw) as { views?: unknown };
+    const views = (typeof profile.views === "number" ? profile.views : 0) + 1;
+    profile.views = views;
+    cache.set(profileKey, JSON.stringify(profile));
+    for (const key of options.keys.slice(1, 4)) {
+      const scoresForKey = board(key);
+      scoresForKey.set(id, (scoresForKey.get(id) ?? 0) + 1);
+    }
+    dirty.add(id);
+    return views;
+  },
+  async sMembers() {
+    return [...dirty];
+  },
+  async sRem(key, member) {
+    sRemCalls.push({ key, member });
+    return dirty.delete(member) ? 1 : 0;
   },
 };
 
@@ -115,9 +175,13 @@ after(async () => {
 beforeEach(async () => {
   cache.clear();
   scores.clear();
+  boards.clear();
+  dirty.clear();
   setCalls = [];
   deletedKeys = [];
   zRemCalls = [];
+  sRemCalls = [];
+  evalCalls = 0;
   await Player.deleteMany({});
 });
 
@@ -152,6 +216,7 @@ function asProfile(json: unknown): ProfileJson {
   assert.equal(typeof profile.username, "string");
   assert.equal(typeof profile.email, "string");
   assert.equal(typeof profile.createdAt, "string");
+  assert.equal(typeof profile.views, "number");
   assert.ok(profile.score === null || typeof profile.score === "number");
   assert.ok(profile.rank === null || typeof profile.rank === "number");
   return profile;
@@ -276,7 +341,7 @@ describe("player routes", { concurrency: 1 }, () => {
     assert.equal(profile.score, 12);
     assert.equal(profile.rank, 1);
     assert.deepEqual(setCalls, [
-      { key: `player:profile:${created._id}`, ex: 3600 },
+      { key: `player:profile:${created._id}`, ex: 3600, nx: true },
     ]);
 
     await Player.deleteOne({ _id: created._id });
@@ -285,6 +350,46 @@ describe("player routes", { concurrency: 1 }, () => {
     assert.equal(cached.status, 200);
     assert.equal(asProfile(cached.json).username, "ada");
     assert.equal(setCalls.length, 1);
+  });
+
+  it("increments views in the profile cache and the three leaderboards", async () => {
+    const created = await createPlayer({
+      username: "ada",
+      email: "ada@example.com",
+    });
+    const now = new Date();
+
+    const first = await request("GET", `/${created._id}`);
+    const second = await request("GET", `/${created._id}`);
+
+    assert.equal(asProfile(first.json).views, 1);
+    assert.equal(asProfile(second.json).views, 2);
+    assert.equal(board(VIEWS_ALL_KEY).get(created._id), 2);
+    assert.equal(board(dailyViewsKey(now)).get(created._id), 2);
+    assert.equal(board(weeklyViewsKey(now)).get(created._id), 2);
+    assert.equal(dirty.has(created._id), true);
+    assert.equal(evalCalls, 2);
+  });
+
+  it("seeds a cache miss from the all-time view score", async () => {
+    const created = await createPlayer({
+      username: "ada",
+      email: "ada@example.com",
+    });
+    board(VIEWS_ALL_KEY).set(created._id, 4);
+
+    const response = await request("GET", `/${created._id}`);
+
+    assert.equal(asProfile(response.json).views, 5);
+    assert.equal(board(VIEWS_ALL_KEY).get(created._id), 5);
+  });
+
+  it("does not count a missing profile", async () => {
+    const missing = await request("GET", "/507f1f77bcf86cd799439011");
+
+    assert.equal(missing.status, 404);
+    assert.equal(evalCalls, 0);
+    assert.equal(dirty.size, 0);
   });
 
   it("returns null score and rank when the player is unranked", async () => {
@@ -386,12 +491,20 @@ describe("player routes", { concurrency: 1 }, () => {
     assert.equal(removed.status, 204);
     assert.equal(removed.json, null);
     assert.deepEqual(deletedKeys, [`player:profile:${created._id}`]);
+    const now = new Date();
     assert.deepEqual(zRemCalls, [
       { key: "leaderboard:global", member: created._id },
+      { key: VIEWS_ALL_KEY, member: created._id },
+      { key: dailyViewsKey(now), member: created._id },
+      { key: weeklyViewsKey(now), member: created._id },
+    ]);
+    assert.deepEqual(sRemCalls, [
+      { key: VIEWS_DIRTY_KEY, member: created._id },
     ]);
     assert.equal(scores.has(created._id), false);
+    assert.equal(board(VIEWS_ALL_KEY).has(created._id), false);
     assert.equal(missing.status, 404);
     assert.equal(missingDelete.status, 404);
-    assert.equal(zRemCalls.length, 1);
+    assert.equal(zRemCalls.length, 4);
   });
 });

@@ -36,7 +36,7 @@ let rangeResult: Array<{ value: string; score: number }> = [];
 let rangeCalls: RangeCall[] = [];
 let redisFails = false;
 const cache = new Map<string, string>();
-let setCalls: Array<{ key: string; ex: number }> = [];
+let setCalls: Array<{ key: string; ex: number; nx: boolean }> = [];
 
 const redis: LeaderboardRedis = {
   async zRangeWithScores(key, min, max, options) {
@@ -50,13 +50,19 @@ const redis: LeaderboardRedis = {
     return keys.map((key) => cache.get(key) ?? null);
   },
   async set(key, value, options) {
+    if (options.NX && cache.has(key)) {
+      return null;
+    }
     cache.set(key, value);
-    setCalls.push({ key, ex: options.EX });
+    setCalls.push({ key, ex: options.EX, nx: options.NX === true });
     return "OK";
   },
   async del(key) {
     cache.delete(key);
     return 1;
+  },
+  async zScore() {
+    return null;
   },
 };
 
@@ -167,7 +173,7 @@ describe("leaderboard routes", { concurrency: 1 }, () => {
     const first = await request("?limit=1");
     assert.equal(asLeaderboard(first.json)[0]?.username, "ada");
     assert.deepEqual(setCalls, [
-      { key: `player:profile:${ada._id.toString()}`, ex: 3600 },
+      { key: `player:profile:${ada._id.toString()}`, ex: 3600, nx: true },
     ]);
 
     await Player.deleteOne({ _id: ada._id });
